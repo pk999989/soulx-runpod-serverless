@@ -1,0 +1,25 @@
+﻿{
+  "input": {
+    "tx_id": "serverless-doodle-test-001",
+    "seed": 11,
+    "format": "wav",
+    "script": {
+      "speakers": {
+        "S1": {
+          "prompt_audio": "example/audios/female_mandarin.wav",
+          "prompt_text": "今天，我們要說一個溫暖的小故事。語氣要柔和、清楚，像在陪小朋友一起翻開一本睡前繪本。"
+        },
+        "S2": {
+          "prompt_audio": "example/audios/male_mandarin.wav",
+          "prompt_text": "不用怕，我會陪著你。勇敢不是都不害怕，而是害怕的時候，還願意慢慢往前走。"
+        }
+      },
+      "text": [
+        ["S1", "今天，CC 打開了一本會發光的繪本。"],
+        ["S2", "咦？Mina 媽媽，你怎麼從我的畫裡走出來了？"],
+        ["S1", "因為你的畫有魔法呀。你畫的每一條線，都在告訴我你心裡的小故事。"],
+        ["S2", "那我們一起去吧。Mina 媽媽，你要一直在旁邊喔。"]
+      ]
+    }
+  }
+}
