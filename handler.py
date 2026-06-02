@@ -14,6 +14,7 @@ ROOT = Path(os.environ.get("SOULX_ROOT", "/workspace/soulx_test/SoulX-Podcast"))
 MODEL_PATH = Path(os.environ.get("SOULX_MODEL_PATH", ROOT / "pretrained_models/SoulX-Podcast-1.7B"))
 OUTPUT_DIR = Path(os.environ.get("SOULX_OUTPUT_DIR", "/tmp/soulx_outputs"))
 MAX_CHARS_PER_SEGMENT = int(os.environ.get("SOULX_MAX_CHARS_PER_SEGMENT", "90"))
+HANDLER_VERSION = "soulx-full-v2-20260602"
 
 
 def _split_zh_text(text, max_chars=MAX_CHARS_PER_SEGMENT):
@@ -99,7 +100,6 @@ def handler(job):
         env = os.environ.copy()
         env["PYTHONPATH"] = str(ROOT)
 
-        
         cmd = [
             "python",
             str(ROOT / "cli/podcast.py"),
@@ -140,6 +140,7 @@ def handler(job):
         warning = f"audio_too_short: duration={duration:.2f}s expected_at_least={min_expected:.2f}s"
 
     return {
+        "handler_version": HANDLER_VERSION,
         "ok": warning is None,
         "warning": warning,
         "message": "SoulX wav generated",
@@ -155,6 +156,7 @@ def handler(job):
 
 
 runpod.serverless.start({"handler": handler})
+
 
 
 
