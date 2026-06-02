@@ -11,7 +11,7 @@ from pathlib import Path
 import runpod
 
 
-HANDLER_VERSION = "soulx-full-v3-path-detect-20260602"
+HANDLER_VERSION = "soulx-full-v4-custom-voice-20260602"
 OUTPUT_DIR = Path(os.environ.get("SOULX_OUTPUT_DIR", "/tmp/soulx_outputs"))
 MAX_CHARS_PER_SEGMENT = int(os.environ.get("SOULX_MAX_CHARS_PER_SEGMENT", "90"))
 
@@ -76,7 +76,7 @@ def _split_text(text, max_chars=MAX_CHARS_PER_SEGMENT):
     if not text:
         return []
 
-    parts = re.split(r"(?<=[.!?;。！？；])", text)
+    parts = re.split(r"(?<=[.!?;????])", text)
     chunks = []
     current = ""
     for part in parts:
@@ -97,9 +97,79 @@ def _split_text(text, max_chars=MAX_CHARS_PER_SEGMENT):
     return chunks
 
 
-def _build_script(payload, root):
+def _write_prompt_audio(value, target_path):
+    if not value:
+        return None
+
+    if isinstance(value, str) and value.startswith("data:"):
+        value = value.split(",", 1)[1]
+
+    try:
+        raw = base64.b64decode(value)
+    except Exception:
+        return None
+
+    if len(raw) < 4000:
+        return None
+
+    target_path.write_bytes(raw)
+    return str(target_path)
+
+
+def _speaker_config(payload, root, tmpdir):
+    default_s1 = str(root / "example/audios/female_mandarin.wav")
+    default_s2 = str(root / "example/audios/male_mandarin.wav")
+
+    custom = payload.get("speakers") if isinstance(payload.get("speakers"), dict) else {}
+    s1_custom = custom.get("S1") if isinstance(custom.get("S1"), dict) else {}
+    s2_custom = custom.get("S2") if isinstance(custom.get("S2"), dict) else {}
+
+    s1_audio = _write_prompt_audio(
+        payload.get("voice_b64")
+        or payload.get("prompt_audio_b64")
+        or s1_custom.get("prompt_audio_b64"),
+        tmpdir / "speaker_s1.wav",
+    )
+    s2_audio = _write_prompt_audio(
+        payload.get("voice2_b64")
+        or payload.get("prompt_audio2_b64")
+        or s2_custom.get("prompt_audio_b64"),
+        tmpdir / "speaker_s2.wav",
+    )
+
+    return {
+        "S1": {
+            "prompt_audio": s1_audio or s1_custom.get("prompt_audio") or default_s1,
+            "prompt_text": s1_custom.get("prompt_text")
+            or payload.get("voice_prompt")
+            or (
+                "Taiwan Mandarin storyteller voice. Warm, gentle, natural, "
+                "like a Taiwanese mother reading a picture book. Avoid mainland Mandarin accent."
+            ),
+        },
+        "S2": {
+            "prompt_audio": s2_audio or s2_custom.get("prompt_audio") or default_s2,
+            "prompt_text": s2_custom.get("prompt_text")
+            or payload.get("voice2_prompt")
+            or (
+                "Taiwan Mandarin co-host voice. Calm, friendly, conversational, "
+                "like a Taiwanese teacher guiding a child. Avoid mainland Mandarin accent."
+            ),
+        },
+    }
+
+
+def _build_script(payload, root, tmpdir):
     if isinstance(payload.get("script"), dict):
-        return payload["script"]
+        script = payload["script"]
+        if isinstance(script.get("speakers"), dict):
+            for speaker_id, speaker in _speaker_config(payload, root, tmpdir).items():
+                script["speakers"].setdefault(speaker_id, speaker)
+                if not script["speakers"][speaker_id].get("prompt_audio"):
+                    script["speakers"][speaker_id]["prompt_audio"] = speaker["prompt_audio"]
+                if not script["speakers"][speaker_id].get("prompt_text"):
+                    script["speakers"][speaker_id]["prompt_text"] = speaker["prompt_text"]
+        return script
 
     dialogue = payload.get("dialogue")
     if dialogue and isinstance(dialogue, list):
@@ -124,21 +194,7 @@ def _build_script(payload, root):
         raise ValueError("No text/script/dialogue found in input.")
 
     return {
-        "speakers": {
-            "S1": {
-                "prompt_audio": str(root / "example/audios/female_mandarin.wav"),
-                "prompt_text": (
-                    "A warm Mandarin storyteller voice. Natural, clear, gentle, "
-                    "with pauses and encouraging emotion."
-                ),
-            },
-            "S2": {
-                "prompt_audio": str(root / "example/audios/male_mandarin.wav"),
-                "prompt_text": (
-                    "A calm Mandarin co-host voice. Friendly, steady, and supportive."
-                ),
-            },
-        },
+        "speakers": _speaker_config(payload, root, tmpdir),
         "text": lines,
     }
 
@@ -162,24 +218,23 @@ def handler(job):
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    try:
-        root, root_checked = _resolve_root()
-        model_path, model_checked = _resolve_model(root)
-        script = _build_script(payload, root)
-    except Exception as exc:
-        return {
-            "handler_version": HANDLER_VERSION,
-            "ok": False,
-            "error": str(exc),
-            "cwd": os.getcwd(),
-            "python": shutil.which("python"),
-            "workspace_listing": _dir_listing("/workspace"),
-            "app_listing": _dir_listing("/app"),
-        }
+    with tempfile.TemporaryDirectory() as audio_tmp, tempfile.TemporaryDirectory() as tmp:
+        try:
+            root, root_checked = _resolve_root()
+            model_path, model_checked = _resolve_model(root)
+            script = _build_script(payload, root, Path(audio_tmp))
+        except Exception as exc:
+            return {
+                "handler_version": HANDLER_VERSION,
+                "ok": False,
+                "error": str(exc),
+                "cwd": os.getcwd(),
+                "python": shutil.which("python"),
+                "workspace_listing": _dir_listing("/workspace"),
+                "app_listing": _dir_listing("/app"),
+            }
 
-    input_chars = sum(len(line[1]) for line in script["text"])
-
-    with tempfile.TemporaryDirectory() as tmp:
+        input_chars = sum(len(line[1]) for line in script["text"])
         script_path = Path(tmp) / "script.json"
         out_path = OUTPUT_DIR / f"{request_id}.wav"
         script_path.write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
