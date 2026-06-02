@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import wave
@@ -10,22 +11,75 @@ from pathlib import Path
 import runpod
 
 
-ROOT = Path(os.environ.get("SOULX_ROOT", "/workspace/soulx_test/SoulX-Podcast"))
-MODEL_PATH = Path(os.environ.get("SOULX_MODEL_PATH", ROOT / "pretrained_models/SoulX-Podcast-1.7B"))
+HANDLER_VERSION = "soulx-full-v3-path-detect-20260602"
 OUTPUT_DIR = Path(os.environ.get("SOULX_OUTPUT_DIR", "/tmp/soulx_outputs"))
 MAX_CHARS_PER_SEGMENT = int(os.environ.get("SOULX_MAX_CHARS_PER_SEGMENT", "90"))
-HANDLER_VERSION = "soulx-full-v2-20260602"
+
+ROOT_CANDIDATES = [
+    os.environ.get("SOULX_ROOT"),
+    "/workspace/SoulX-Podcast",
+    "/workspace/soulx_test/SoulX-Podcast",
+    "/app/SoulX-Podcast",
+    "/workspace",
+    "/app",
+]
 
 
-def _split_zh_text(text, max_chars=MAX_CHARS_PER_SEGMENT):
+def _resolve_root():
+    checked = []
+    for item in ROOT_CANDIDATES:
+        if not item:
+            continue
+        root = Path(item)
+        checked.append(str(root))
+        if (root / "cli/podcast.py").exists() and (root / "soulxpodcast").exists():
+            return root, checked
+
+    for base in [Path("/workspace"), Path("/app")]:
+        if not base.exists():
+            continue
+        for found in base.rglob("cli/podcast.py"):
+            root = found.parent.parent
+            checked.append(str(root))
+            if (root / "soulxpodcast").exists():
+                return root, checked
+
+    raise FileNotFoundError(
+        "Cannot find SoulX-Podcast root. Checked: " + ", ".join(checked)
+    )
+
+
+def _resolve_model(root):
+    candidates = [
+        os.environ.get("SOULX_MODEL_PATH"),
+        root / "pretrained_models/SoulX-Podcast-1.7B",
+        root / "SoulX-Podcast-1.7B",
+        "/runpod-volume/pretrained_models/SoulX-Podcast-1.7B",
+        "/workspace/pretrained_models/SoulX-Podcast-1.7B",
+    ]
+    checked = []
+    for item in candidates:
+        if not item:
+            continue
+        model_path = Path(item)
+        checked.append(str(model_path))
+        if model_path.exists():
+            return model_path, checked
+
+    raise FileNotFoundError(
+        "Cannot find SoulX model path. Checked: " + ", ".join(checked)
+    )
+
+
+def _split_text(text, max_chars=MAX_CHARS_PER_SEGMENT):
     text = re.sub(r"\s+", " ", (text or "").strip())
     if not text:
         return []
 
-    raw_parts = re.split(r"(?<=[。！？!?；;])", text)
+    parts = re.split(r"(?<=[.!?;。！？；])", text)
     chunks = []
     current = ""
-    for part in raw_parts:
+    for part in parts:
         part = part.strip()
         if not part:
             continue
@@ -43,22 +97,28 @@ def _split_zh_text(text, max_chars=MAX_CHARS_PER_SEGMENT):
     return chunks
 
 
-def _build_script(payload):
+def _build_script(payload, root):
     if isinstance(payload.get("script"), dict):
         return payload["script"]
 
-    text = payload.get("text") or payload.get("prompt") or payload.get("narration") or ""
     dialogue = payload.get("dialogue")
     if dialogue and isinstance(dialogue, list):
         lines = []
         for item in dialogue:
-            speaker = item.get("speaker", "S1") if isinstance(item, dict) else "S1"
-            line = item.get("text", "") if isinstance(item, dict) else str(item)
-            if line.strip():
-                lines.append([speaker, line.strip()])
+            if isinstance(item, dict):
+                speaker = item.get("speaker", "S1")
+                line = item.get("text", "")
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                speaker = item[0]
+                line = item[1]
+            else:
+                speaker = "S1"
+                line = str(item)
+            if str(line).strip():
+                lines.append([str(speaker), str(line).strip()])
     else:
-        chunks = _split_zh_text(text)
-        lines = [["S1", chunk] for chunk in chunks]
+        text = payload.get("text") or payload.get("prompt") or payload.get("narration") or ""
+        lines = [["S1", chunk] for chunk in _split_text(text)]
 
     if not lines:
         raise ValueError("No text/script/dialogue found in input.")
@@ -66,15 +126,20 @@ def _build_script(payload):
     return {
         "speakers": {
             "S1": {
-                "prompt_audio": str(ROOT / "example/audios/female_mandarin.wav"),
-                "prompt_text": "溫柔、清楚、像台灣媽媽說故事一樣，語氣自然，有停頓，也有鼓勵孩子的感覺。"
+                "prompt_audio": str(root / "example/audios/female_mandarin.wav"),
+                "prompt_text": (
+                    "A warm Mandarin storyteller voice. Natural, clear, gentle, "
+                    "with pauses and encouraging emotion."
+                ),
             },
             "S2": {
-                "prompt_audio": str(ROOT / "example/audios/male_mandarin.wav"),
-                "prompt_text": "不用怕，我會陪著你。勇敢不是都不害怕，而是害怕的時候，還願意慢慢往前走。"
-            }
+                "prompt_audio": str(root / "example/audios/male_mandarin.wav"),
+                "prompt_text": (
+                    "A calm Mandarin co-host voice. Friendly, steady, and supportive."
+                ),
+            },
         },
-        "text": lines
+        "text": lines,
     }
 
 
@@ -83,13 +148,35 @@ def _wav_duration(path):
         return wav.getnframes() / float(wav.getframerate())
 
 
+def _dir_listing(path):
+    base = Path(path)
+    if not base.exists():
+        return []
+    return [p.name for p in base.iterdir()][:80]
+
+
 def handler(job):
     payload = job.get("input") or {}
     seed = int(payload.get("seed", 7))
     request_id = job.get("id") or "manual"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    script = _build_script(payload)
+
+    try:
+        root, root_checked = _resolve_root()
+        model_path, model_checked = _resolve_model(root)
+        script = _build_script(payload, root)
+    except Exception as exc:
+        return {
+            "handler_version": HANDLER_VERSION,
+            "ok": False,
+            "error": str(exc),
+            "cwd": os.getcwd(),
+            "python": shutil.which("python"),
+            "workspace_listing": _dir_listing("/workspace"),
+            "app_listing": _dir_listing("/app"),
+        }
+
     input_chars = sum(len(line[1]) for line in script["text"])
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -98,15 +185,15 @@ def handler(job):
         script_path.write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(ROOT)
+        env["PYTHONPATH"] = str(root)
 
         cmd = [
             "python",
-            str(ROOT / "cli/podcast.py"),
+            str(root / "cli/podcast.py"),
             "--json_path",
             str(script_path),
             "--model_path",
-            str(MODEL_PATH),
+            str(model_path),
             "--output_path",
             str(out_path),
             "--seed",
@@ -114,7 +201,7 @@ def handler(job):
         ]
         completed = subprocess.run(
             cmd,
-            cwd=str(ROOT),
+            cwd=str(root),
             env=env,
             capture_output=True,
             text=True,
@@ -123,6 +210,7 @@ def handler(job):
 
         if completed.returncode != 0:
             return {
+                "handler_version": HANDLER_VERSION,
                 "ok": False,
                 "error": "SoulX inference failed",
                 "returncode": completed.returncode,
@@ -130,6 +218,8 @@ def handler(job):
                 "stderr": completed.stderr[-4000:],
                 "segments_count": len(script["text"]),
                 "input_chars": input_chars,
+                "soulx_root": str(root),
+                "model_path": str(model_path),
             }
 
     duration = _wav_duration(out_path)
@@ -151,6 +241,8 @@ def handler(job):
         "input_chars": input_chars,
         "segments_count": len(script["text"]),
         "script_preview": script["text"][:3],
+        "soulx_root": str(root),
+        "model_path": str(model_path),
         "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
     }
 
